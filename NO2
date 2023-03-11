@@ -1,0 +1,245 @@
+var band_viz = {
+  min: 0,
+  max: 0.0002,
+  palette: ['black', 'green', 'purple', 'cyan', 'blue', 'yellow', 'red']
+};
+
+{//Define the IMAGE DATA: "daterange_set"
+var daterg0 = ee.DateRange('2018-07-01','2018-07-31');
+var daterg1 = ee.DateRange('2018-08-01','2018-08-31');
+var daterg2 = ee.DateRange('2018-09-01','2018-09-30');
+var daterg3 = ee.DateRange('2018-10-01','2018-10-31');
+var daterg4 = ee.DateRange('2018-11-01','2018-11-30');
+var daterg5 = ee.DateRange('2018-12-01','2018-12-31');
+var daterg6 = ee.DateRange('2019-01-01','2019-01-31');
+var daterg7 = ee.DateRange('2019-02-01','2019-02-28');
+var daterg8 = ee.DateRange('2019-03-01','2019-03-31');
+var daterg9 = ee.DateRange('2019-04-01','2019-04-30');
+var daterg10 = ee.DateRange('2019-05-01','2019-05-31');
+var daterg11 = ee.DateRange('2019-06-01','2019-06-30');
+var daterg12 = ee.DateRange('2019-07-01','2019-07-31');
+var daterg13 = ee.DateRange('2019-08-01','2019-08-31');
+var daterg14 = ee.DateRange('2019-09-01','2019-09-30');
+var daterg15 = ee.DateRange('2019-10-01','2019-10-31');
+var daterg16 = ee.DateRange('2019-11-01','2019-11-30');
+var daterg17 = ee.DateRange('2019-12-01','2019-12-31');
+var daterg18 = ee.DateRange('2020-01-01','2020-01-31');
+var daterg19 = ee.DateRange('2020-02-01','2020-02-29');
+var daterg20 = ee.DateRange('2020-03-01','2020-03-31');
+var daterange_set = ee.List([daterg0,daterg1,daterg2,daterg3,daterg4,daterg5,
+								daterg6,daterg7,daterg8,daterg9,daterg10,
+								daterg11,daterg12,daterg13,daterg14,daterg15,
+								daterg16,daterg17,daterg18,daterg19,daterg20])
+}//Define the IMAGE DATA: "daterange_set"
+function cloudMask(image) { 
+  var k = image.updateMask(image.select("cloud_fraction").lt(0.2));
+  return k.select('tropospheric_NO2_column_number_density')
+}
+function getS5pNo2IMGcol(daterange){
+	var col = NO2.select(['tropospheric_NO2_column_number_density','cloud_fraction'])
+					.filterDate(daterange)
+						.map(cloudMask)
+	var img = col.mean().clip(GBA);
+	return img;
+}
+var i = 0
+var IMGList = ee.List([]);
+while (i < 21){
+	var daterange = daterange_set.get(i);
+	IMGList = IMGList.add(getS5pNo2IMGcol(daterange))
+	i++;
+}
+print(IMGList,'IMGList')
+
+var NO2IMGCOL = ee.ImageCollection(IMGList);
+print(NO2IMGCOL,'NO2IMGCOL')
+
+var MeanNO2IMG = NO2IMGCOL.mean()
+Map.addLayer(MeanNO2IMG,band_viz,'MeanNO2IMG')
+
+var BandnameList = ee.List([201807,201808,201809,201810,201811,201812,201901,201902,201903,201904,201905,201906,201907,201908,201909,201910,201911,201912,202001,202002,202003])
+
+
+function List2IMG(imglist,bnlist){
+  var icount = 0
+  var gbaimg = ee.Image();
+  while (icount < 21){
+  var bandname = bnlist.get(icount)
+  var aimg = ee.Image(imglist.get(icount)).rename(ee.String(bandname))
+  gbaimg = gbaimg.addBands(aimg)
+  icount++;
+  }
+  return gbaimg;
+}
+var GBANO2IMG = List2IMG(IMGList,BandnameList).slice(1,22)
+print(GBANO2IMG,'GBANO2IMG')
+
+
+function sts_mean(image){  
+  var i = 0
+  var meanlist = ee.List([]);
+  while (i<21){
+    var timage = GBANO2IMG.select(i)
+    var mean = timage.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry:GBA,
+    scale: 1000,
+    maxPixels: 1e9,});
+   // print(mean,'mean')
+    meanlist = meanlist.add(mean);
+    i++;
+  }
+  return meanlist;}//Function to cal the MEAN VALUE
+  
+var MeanN02List =  sts_mean(GBANO2IMG)
+print(MeanN02List,'MeanN02List')
+function getNumFromList(lista,listb){
+	var nummeanlist = ee.List([])
+	var i = 0
+	while (i<21){
+		nummeanlist = nummeanlist.add(ee.Dictionary(lista.get(i)).getNumber(listb.get(i)))
+		i++;
+	}
+	return nummeanlist;
+}
+var NumMeanList = getNumFromList(MeanN02List,BandnameList)
+print(NumMeanList,'NumMeanList')
+
+{
+var xlist = ee.List([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21])
+var yValues = ee.Array(NumMeanList);
+var xValues = ee.Array(xlist);
+{
+var chart = ui.Chart.array.values(yValues, 0, xValues)
+    .setSeriesNames(['NO2 Mean'])
+    .setChartType('ScatterChart')
+    .setOptions({
+      title: '粤港澳大湾区 tropospheric vertical column of NO2',
+      hAxis: {'title': 'months(start:2018-07;end:2020-03)'},
+      vAxis: {'title': 'mean_value(mol/m^2)'},
+      pointSize: 10,
+      lineWidth: 1,
+      
+});
+print(chart);
+}
+}//Generate the Point Chart
+
+Map.addLayer(GBANO2IMG.select(20),band_viz,'GBA NO2')//绘制GBA边界
+
+{
+var empty = ee.Image().byte();
+var outline = empty.paint({
+  featureCollection: GBA,
+  color: 1,
+  width: 2
+});
+//Map.addLayer(outline,{},'GBA')
+}//绘制GBA边界
+
+var fc = ee.FeatureCollection(GBA)
+//print(fc,'fc')
+
+var cities_meanNO2 = GBANO2IMG.reduceRegions({
+  collection: fc,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+})
+print(cities_meanNO2,'cities_meanNO2')
+
+
+
+var options = {
+  title: 'tropospheric vertical column of NO2 in GBA cities',
+  hAxis: {title: 'months(start:2018-07;end:2020-03)'},
+  vAxis: {title: 'mean_value(mol/m^2)'},
+  lineWidth: 1,
+  pointSize: 2,
+  series: {
+    0: {color: '00FF00'}, // 东莞
+    1: {color: '0000FF'}, // 中山
+    2: {color: 'FF0000'}, // 珠海
+    3: {color: 'FFA500'}, // 佛山
+    4: {color: 'FF00FF'}, // 江门
+    5: {color: '00FFFF'}, // 肇庆
+    6: {color: 'FFFF00'}, // 惠州
+    7: {color: '0F0F0F'}, // 广州
+    8: {color: '0000EE'}, // 深圳
+    9: {color: '008000'}, // 香港
+    10: {color: '00BFFF'}, // 澳门
+}};
+
+var tlist = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21]
+var aChart = ui.Chart.image.regions(
+    GBANO2IMG, fc, ee.Reducer.mean(), 1000, '市', tlist)
+        .setChartType('ScatterChart')
+        .setOptions(options);
+print(aChart,'aChart')
+
+/*Export.image.toDrive({
+  image: GBANO2IMG,
+  description: 'GBANO2IMG',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: MeanNO2IMG,
+  description: 'MeanNO2IMG',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});*/
+
+var daterg_NDVI = ee.DateRange('2018-07-01','2020-03-31');
+var ndvicol = MOD13A2.filterDate(daterg_NDVI).filterBounds(GBA).mean()
+var ndvi =  ndvicol.select(0).clip(GBA)
+print(ndvi,'ndvi')
+var dnbcol = DNB.filterDate(daterg_NDVI).filterBounds(GBA).mean()
+var dnb =  dnbcol.select(0).clip(GBA)
+print(dnb,'dnb')
+//var ndvi_gba = ndvicol.mean()
+var dem = SRTM.clip(GBA)
+print(dem,'dem')
+var lstcol = MOD11A2.filterDate(daterg_NDVI).filterBounds(GBA).mean()
+var lst =  lstcol.select(0).clip(GBA).multiply(0.02)
+print(lst,'lst')
+var ips = TIPS.clip(GBA)
+print(ips,'ips')
+
+Export.image.toDrive({
+  image: ndvi,
+  description: 'GBA_ndvi',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: dnb,
+  description: 'GBA_dnb',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: dem,
+  description: 'GBA_dem',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: lst,
+  description: 'GBA_lst',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});
+Export.image.toDrive({
+  image: ips,
+  description: 'GBA_ips',
+  scale: 500,
+  region: GBA,
+  fileFormat: 'GeoTIFF'
+});
