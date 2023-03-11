@@ -1,0 +1,182 @@
+var MOD09A1 = ee.ImageCollection("MODIS/006/MOD09A1"),
+    MOD11A2 = ee.ImageCollection("MODIS/006/MOD11A2"),
+    MOD13A1 = ee.ImageCollection("MODIS/006/MOD13A1"),
+    sa = table;
+Map.centerObject(sa)
+var palettes = require('users/gena/packages:palettes');//导入下色带
+var mypalette = palettes.colorbrewer.RdYlBu[6]//选个看的顺眼的
+
+//创建时间序列的DateRange
+var Sdate = ee.Date('2000-01-01')//Start date
+var Edate = ee.Date('2020-12-31')//End date
+var DateRG = ee.List.sequence(0,Edate.difference(Sdate,'year'),5)//generate the date sequence list
+					.map(function(n){return Sdate.advance(n,'year')})
+						.map(function(i){return ee.Date(i).getRange('year')})
+print(DateRG,'DateRG')
+//定义MOD09A1的去云函数
+function cloudfree_mod09a1(image){
+  function bitwiseExtract(value, fromBit, toBit) {
+    if (toBit === undefined) toBit = fromBit
+    var maskSize = ee.Number(1).add(toBit).subtract(fromBit)
+    var mask = ee.Number(1).leftShift(maskSize).subtract(1)
+    return value.rightShift(fromBit).bitwiseAnd(mask)}
+  var qa = image.select('StateQA')
+  var cloudState = bitwiseExtract(qa, 0, 1) 
+  var cloudShadowState = bitwiseExtract(qa, 2)
+  var cirrusState = bitwiseExtract(qa, 8, 9)
+  var mask = cloudState.eq(0) // Clear
+                        .and(cloudShadowState.eq(0)) // No cloud shadow
+                        .and(cirrusState.eq(0)) // No cirrus
+  return image.updateMask(mask)}
+//计算最近一期的水体指数，并简单的使用阈值进行水体提取
+function cal_mndwi(image){ return image.normalizedDifference(['sur_refl_b04', 'sur_refl_b06']).rename('mndwi')}
+var rencentIMG = MOD09A1.filterDate(DateRG.get(4)).filterBounds(sa).map(cloudfree_mod09a1).mean().clip(sa)
+var WaterMask = cal_mndwi(ee.Image(rencentIMG)).lt(0.2)
+//定义主函数，用于生产四个分量的4波段影像以便于后续的PCA分析
+//该函数以DateRange为输入参数，输出4波段的对应影像
+function GetIMG(dr){
+  var rawIMG = ee.Image()
+  function sts_minmax (image){
+    var minmax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry:sa,
+    scale: 500,
+    maxPixels: 1e9}).values();
+    return minmax;}
+  function getLST(dr){
+    var rawLST =  MOD11A2.filterDate(dr)
+                    .filterBounds(sa).mosaic().clip(sa).select('LST_Day_1km')
+                    .multiply(0.02).subtract(273.15).rename('lst').updateMask(WaterMask)
+    var minMax = sts_minmax(rawLST)
+    var LST = rawLST.unitScale(12,minMax.get(0))
+    return LST}
+  function getNDVI(dr){
+    var rawNDVI = MOD13A1.filterDate(dr).filterBounds(sa)
+                  .mosaic().clip(sa).select('NDVI')
+                  .multiply(0.0001).rename('ndvi').updateMask(WaterMask)
+    var minMax = sts_minmax(rawNDVI)
+    var NDVI = rawNDVI.unitScale(minMax.get(1),minMax.get(0))
+    return NDVI}
+  function getWET(dr){
+    var srIMG = MOD09A1.filterDate(dr).filterBounds(sa).map(cloudfree_mod09a1)
+                        .mosaic().clip(sa)
+    var rawWET = srIMG.select(0).multiply(0.1147)
+              .add(srIMG.select(1).multiply(0.2489))
+              .add(srIMG.select(2).multiply(0.2408))
+              .add(srIMG.select(3).multiply(0.3132))
+              .add(srIMG.select(4).multiply(-0.3122))
+              .add(srIMG.select(5).multiply(-0.6416))
+              .add(srIMG.select(6).multiply(-0.5087))
+              .multiply(0.0001).rename('wet').updateMask(WaterMask)
+    var minMax = sts_minmax(rawWET)
+    var WET = rawWET.unitScale(minMax.get(1),minMax.get(0))
+    return WET}
+  function getNDBSI(dr){
+    var srIMG = MOD09A1.filterDate(dr).filterBounds(sa).map(cloudfree_mod09a1)
+                        .mosaic().clip(sa)
+    var swir1 = srIMG.select(5);
+    var red = srIMG.select(0);
+    var nir1 = srIMG.select(1);
+    var blue = srIMG.select(2);
+    var green = srIMG.select(3);
+    var bi = swir1.add(red).subtract(nir1.add(blue)).divide(swir1.add(red).add(nir1.add(blue)));
+    var ibi = swir1.multiply(2).divide(swir1.add(nir1)).subtract(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1))))
+                  .divide(swir1.multiply(2).divide(swir1.add(nir1)).add(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1)))));
+    var rawNDBSI = bi.add(ibi).divide(2).rename('ndbsi').updateMask(WaterMask)
+    var minMax = sts_minmax(rawNDBSI)
+    var NDBSI = rawNDBSI.unitScale(minMax.get(1),minMax.get(0))
+    return NDBSI}
+  return rawIMG.addBands(getNDVI(dr))
+                .addBands(getLST(dr))
+                .addBands(getWET(dr))
+                .addBands(getNDBSI(dr)).slice(1,5)}
+//使用map来生产所有时间区间的4波段分量影像
+var IndexCol = DateRG.map(GetIMG)
+//定义PCA函数
+function pca_model(image){
+  var scale = 500;
+  var bandNames = image.bandNames();
+  var region = sa;
+  var meanDict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry:region,
+    scale: scale,
+    maxPixels: 1e9});
+  var means = ee.Image.constant(meanDict.values(bandNames));
+  var centered = image.subtract(means);
+  var getNewBandNames = function(prefix) {
+  var seq = ee.List.sequence(1, bandNames.length());
+  return seq.map(function(b) {
+    return ee.String(prefix).cat(ee.Number(b).int());
+  })};
+  var arrays = centered.toArray();
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e9
+  });
+  var covarArray = ee.Array(covar.get('array'));
+  var eigens = covarArray.eigen();
+  var eigenValues = eigens.slice(1, 0, 1);
+  var eigenVectors = eigens.slice(1, 1);
+  var arrayImage = arrays.toArray(1);
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+  var sdImage = ee.Image(eigenValues.sqrt())
+    .arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+  return principalComponents
+    .arrayProject([0])
+    .arrayFlatten([getNewBandNames('pc')])
+    .divide(sdImage);
+}
+//使用map方法来生成时序的PCA1
+var PCA1_result = ee.ImageCollection(IndexCol).map(pca_model).select(0)
+//定义归一化函数
+function normlizedPCA1(image){
+  function sts_minmax (image){
+    var minmax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry:sa,
+    scale: 500,
+    maxPixels: 1e9}).values();
+    return minmax;}
+  var minMax = sts_minmax(image)
+  return image.unitScale(minMax.get(1),minMax.get(0)).rename('rsei')}
+var RSEI = PCA1_result.map(normlizedPCA1)
+//设置RSEI的影像的时间属性
+var DateRG_start = DateRG.map(function (dr){return ee.DateRange(dr).start()})
+var zipRSEI = RSEI.toList(DateRG.length()).zip(DateRG_start)
+function setSystime(image){
+  var systime = ee.Date(ee.List(image).get(1)).advance(6,'month')
+  return ee.Image(ee.List(image).get(0)).set('system:time_start',systime)}
+var stimeRSEI = zipRSEI.map(setSystime)
+//加载最近的一景RSEI看看
+Map.addLayer(ee.Image(stimeRSEI.get(4)),{min:0,max:1,palette:mypalette},'rsei')
+
+//定义折线图的参数
+var options = {
+  width: 400,
+  height: 240,
+  legend: {position: 'top', textStyle: {color: 'blue', fontSize: 16}},
+  lineWidth: 1,
+  pointSize: 5, 
+  vAxis:{
+    title: RSEI},
+  trendlines: {
+    0: {
+      type: 'linear',
+      color: 'red',
+      lineWidth: 1,
+      opacity: 0.8,
+      showR2: true,
+      visibleInLegend: true}},
+  title: 'Timeserise RSEI',};
+var RSEImean = ui.Chart.image.seriesByRegion({
+  imageCollection:stimeRSEI,
+  regions:sa,
+  reducer: ee.Reducer.mean(),
+  scale: 500,
+  seriesProperty: "RSEI"
+}).setOptions(options)
+//打印下RSEI时序折线图
+print(RSEImean,'RSEImean')
