@@ -1,0 +1,266 @@
+Map.centerObject(a)
+var palettes = require('users/gena/packages:palettes');
+var mypalette = palettes.colorbrewer.RdYlBu[6]
+
+
+function maskL8sr(image) {
+  // Bit 0 - Fill
+  // Bit 1 - Dilated Cloud
+  // Bit 2 - Cirrus
+  // Bit 3 - Cloud
+  // Bit 4 - Cloud Shadow
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+
+  // Apply the scaling factors to the appropriate bands.
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+
+  // Replace the original bands with the scaled ones and apply the masks.
+  return image.addBands(opticalBands, null, true)
+      .addBands(thermalBands, null, true)
+      .updateMask(qaMask)
+      .updateMask(saturationMask);
+}
+
+var dr4 = ee.DateRange('2015-05-02','2015-09-25');
+var DateRG = ee.List([dr4])
+print(DateRG);
+/*
+var Sdate = ee.Date('2015-01-01');//Start date
+var Edate = ee.Date('2020-12-31');//End date
+var DateRG = ee.List.sequence(0,Edate.difference(Sdate,'year'),2)//generate the date sequence list
+					.map(function(n){return Sdate.advance(n,'year')})
+						.map(function(i){return ee.Date(i).getRange('year')});
+print(DateRG,'DateRG');
+
+*/
+function cal_mndwi(image){ return image.normalizedDifference(['SR_B3', 'SR_B5']).rename('mndwi')}
+var rencentIMG = L8.filterDate('2015-05-01','2016-09-28').filter(ee.Filter.calendarRange(6,8,"month")).filterBounds(a).map(maskL8sr).median().clip(a);
+var WaterMask = cal_mndwi(ee.Image(rencentIMG)).lt(0.1);
+function GetIMG(dr){
+  var rawIMG = ee.Image();
+
+  var srIMG1 = L8.filterDate('2015-05-01','2016-09-28').filter(ee.Filter.calendarRange(6,8,"month")).filterBounds(a).map(maskL8sr)
+                      
+  var srIMG = srIMG1.median().clip(a).updateMask(WaterMask);
+  function sts_minmax (image){
+    var minmax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry:a,
+    scale: 30,
+    maxPixels: 1e11}).values();
+    return minmax;}
+  function getLST(dr){
+    var LandsatLST = require('users/lengshaijie/LST:Landsat_LSTL8');
+    var satellite = 'L8';
+    var date_start = '2015-05-01';
+    var date_end = '2016-09-28';
+    var use_ndvi = false;
+    // get landsat collection with added variables: NDVI, FVC, TPW, EM, LST
+    var LandsatColl = LandsatLST.collection(satellite, date_start, date_end,a, use_ndvi).select('LST')
+                                .clip(a).updateMask(WaterMask);
+    var minMax = sts_minmax(LandsatColl);
+    var LST = LandsatColl.unitScale(12,minMax.get(0));
+    return LST}
+  function getNDVI(dr){
+     
+    var rawNDVI = srIMG.normalizedDifference(['SR_B5', 'SR_B4']).rename('ndvi');
+    var minMax = sts_minmax(rawNDVI);
+    var NDVI = rawNDVI.unitScale(minMax.get(1),minMax.get(0));
+    return NDVI}
+  function getWET(dr){
+    var rawWET = srIMG.select(1).multiply(0.1511)
+              .add(srIMG.select(2).multiply(0.1973))
+              .add(srIMG.select(3).multiply(0.3283))
+              .add(srIMG.select(4).multiply(0.3407))
+              .add(srIMG.select(5).multiply(-0.7117))
+              .add(srIMG.select(6).multiply(-0.4559))
+              .multiply(0.0001).rename('wet');
+    var minMax = sts_minmax(rawWET);
+    var WET = rawWET.unitScale(minMax.get(1),minMax.get(0));
+    return WET}
+  function getNDBSI(dr){
+    var swir1 = srIMG.select(5);
+    var red = srIMG.select(3);
+    var nir1 = srIMG.select(4);
+    var blue = srIMG.select(1);
+    var green = srIMG.select(2);
+    var bi = swir1.add(red).subtract(nir1.add(blue)).divide(swir1.add(red).add(nir1.add(blue)));
+    var ibi = swir1.multiply(2).divide(swir1.add(nir1)).subtract(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1))))
+                  .divide(swir1.multiply(2).divide(swir1.add(nir1)).add(nir1.divide(nir1.add(red)).add(green.divide(green.add(swir1)))));
+    var rawNDBSI = bi.add(ibi).divide(2).rename('ndbsi');
+    var minMax = sts_minmax(rawNDBSI);
+    var NDBSI = rawNDBSI.unitScale(minMax.get(1),minMax.get(0));
+    return NDBSI}
+    /*Export.image.toDrive({ 
+        image:rawIMG.addBands(getNDBSI(dr)), 
+        region: a, 
+        scale: 30, 
+        crs: "EPSG:4326", 
+        maxPixels: 1e13 
+      }); */
+  return rawIMG.addBands(getLST(dr))
+                .addBands(getNDVI(dr))
+                .addBands(getWET(dr))
+                .addBands(getNDBSI(dr)).slice(1,5)}
+                
+var IndexCol = DateRG.map(GetIMG);
+print(IndexCol,'IndexCol');
+
+function pca_model(image){
+  var scale = 30;
+  var bandNames = image.bandNames();
+  var region = a;
+  var meanDict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry:region,
+    scale: scale,
+    maxPixels: 1e11});
+  var means = ee.Image.constant(meanDict.values(bandNames));
+  var centered = image.subtract(means);
+  var getNewBandNames = function(prefix) {
+  var seq = ee.List.sequence(1, bandNames.length());
+  return seq.map(function(b) {
+    return ee.String(prefix).cat(ee.Number(b).int());
+  })};
+  var arrays = centered.toArray();
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e13
+  });
+  var covarArray = ee.Array(covar.get('array'));
+  var eigens = covarArray.eigen();
+  var eigenValues = eigens.slice(1, 0, 1);
+  var eigenVectors = eigens.slice(1, 1);
+  var arrayImage = arrays.toArray(1);
+  var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+  var sdImage = ee.Image(eigenValues.sqrt())
+    .arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+  return principalComponents
+    .arrayProject([0])
+    .arrayFlatten([getNewBandNames('pc')])
+    .divide(sdImage);
+}
+var PCA1_result = ee.ImageCollection(IndexCol).map(pca_model).select(0);
+//print(PCA1_result);
+
+
+function normlizedPCA1(image){
+  function sts_minmax (image){
+    var minmax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry:a,
+    scale: 30,
+    maxPixels: 1e11}).values();
+    return minmax;}
+  var minMax = sts_minmax(image);
+  return image.unitScale(minMax.get(1),minMax.get(0)).rename('rsei')}
+var RSEI = PCA1_result.map(normlizedPCA1);
+//print(RSEI);
+/*
+//part1计算特征值
+function pca_modeleigenValues(k){
+  var image =  ee.Image(k)
+  var scale = 30;
+  var bandNames = image.bandNames();
+  var region = a;
+  var meanDict = image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry:region,
+    scale: scale,
+    maxPixels: 1e11
+  });
+  var means = ee.Image.constant(meanDict.values(bandNames));
+  var centered = image.subtract(means);
+  var getNewBandNames = function(prefix) {
+  var seq = ee.List.sequence(1, bandNames.length());
+  return seq.map(function(b) {
+    return ee.String(prefix).cat(ee.Number(b).int());
+  })};
+  var arrays = centered.toArray();
+  var covar = arrays.reduceRegion({
+    reducer: ee.Reducer.centeredCovariance(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e11
+  });
+  var covarArray = ee.Array(covar.get('array'));
+  var eigens = covarArray.eigen();
+  var eigenValues = eigens.slice(1, 0, 1);
+  return eigenValues}
+var s_eigenValues = IndexCol.map(pca_modeleigenValues)
+
+print(s_eigenValues,'eigenValues')
+/*
+var DateRG_start = DateRG.map(function (dr){return ee.DateRange(dr).start()});
+var zipRSEI = RSEI.toList(DateRG.length()).zip(DateRG_start);
+function setSystime(image){
+  var systime = ee.Date(ee.List(image).get(1)).advance(6,'month');
+  return ee.Image(ee.List(image).get(0)).set('system:time_start',systime)}
+
+var stimeRSEI = zipRSEI.map(setSystime);
+Map.addLayer(ee.Image(stimeRSEI.get(4)),{min:0,max:1,palette:mypalette},'rsei');
+
+//print(stimeRSEI,'stimeRSEI')
+var options = {
+  width: 400,
+  height: 240,
+  legend: {position: 'top', textStyle: {color: 'blue', fontSize: 16}},
+  lineWidth: 1,
+  pointSize: 5, 
+  vAxis:{
+    title: RSEI
+  },
+  trendlines: {
+    0: {
+      type: 'linear',
+      color: 'red',
+      lineWidth: 1,
+      opacity: 0.8,
+      showR2: true,
+      visibleInLegend: true
+    }},
+  title: 'Timeserise RSEI',
+
+};
+;
+var RSEImean = ui.Chart.image.seriesByRegion({
+  imageCollection:stimeRSEI,
+  regions:a,
+  reducer: ee.Reducer.mean(),
+  scale: 30,
+  seriesProperty: "RSEI"
+}).setOptions(options);
+print(RSEImean,'RSEImean');
+*/
+function exportImageCollection(imgCol) { 
+  var indexList = imgCol.reduceColumns(ee.Reducer.toList(), ["system:index"]) 
+                        .get("list"); 
+  indexList.evaluate(function(indexs) { 
+    for (var i=0; i<indexs.length; i++) { 
+      var image = imgCol.filter(ee.Filter.eq("system:index", indexs[i])).first(); 
+      image = image.clip(a)
+      Export.image.toDrive({ 
+        image: image, 
+        description: indexs[i], 
+        fileNamePrefix: indexs[i], 
+        region: a, 
+        scale: 30, 
+        crs: "EPSG:4326", 
+        maxPixels: 1e13 
+      }); 
+    } 
+  }); 
+} 
+exportImageCollection(RSEI);
+/*
+Export.image.toDrive({ 
+        image: RSEI, 
+        region: a, 
+        scale: 30, 
+        crs: "EPSG:4326", 
+        maxPixels: 1e13 
+      }); */
